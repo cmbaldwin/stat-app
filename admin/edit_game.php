@@ -75,6 +75,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['
 
                     $filename = 'game_' . $game_id . '_' . time() . '.' . $extension;
                     if (move_uploaded_file($file['tmp_name'], $uploadDir . $filename)) {
+                        require_once '../includes/ImageHelper.php';
+                        ImageHelper::optimizeImage($uploadDir . $filename, $uploadDir . $filename);
                         $game_image = $filename;
                     } else {
                         $uploadError = "Failed to move uploaded file. Check folder permissions.";

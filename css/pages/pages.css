@@ -286,6 +286,76 @@
 }
 
 /* Games */
+.games-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: var(--spacing-4);
+    margin-bottom: var(--spacing-4);
+}
+
+.games-header-row h2 {
+    margin-bottom: 0;
+}
+
+.games-list-toolbar {
+    display: flex;
+    align-items: center;
+}
+
+.sort-form {
+    display: flex;
+    align-items: center;
+}
+
+.sort-group {
+    display: flex;
+    align-items: center;
+    gap: var(--spacing-2);
+}
+
+.sort-label {
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-medium);
+    color: var(--color-text-soft);
+    white-space: nowrap;
+}
+
+.sort-select {
+    width: auto !important;
+    min-width: 12rem;
+    padding: 0.4rem 2rem 0.4rem 0.75rem;
+    font-size: var(--font-size-sm);
+    height: auto;
+}
+
+.game-card__stats {
+    margin-top: var(--spacing-3);
+    padding-top: var(--spacing-3);
+    border-top: 1px solid var(--color-border);
+    display: flex;
+    flex-direction: column;
+    gap: var(--spacing-1);
+}
+
+.game-card__stat-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.85rem;
+}
+
+.game-card__stat-label {
+    color: var(--color-text-soft);
+    font-weight: var(--font-weight-regular);
+}
+
+.game-card__stat-value {
+    color: var(--color-text);
+    font-weight: var(--font-weight-semibold);
+}
+
 .games-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
