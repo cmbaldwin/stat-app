@@ -45,9 +45,13 @@ if (!in_array($sort_column, $allowed_columns)) {
 }
 
 // Pagination settings
-$results_per_page = 25; // Show 25 results at a time
+$view_all = (isset($_GET['all']) && $_GET['all'] === '1') || (isset($_GET['limit']) && strtolower((string)$_GET['limit']) === 'all');
+$results_per_page = 25; // Default show 25 results at a time
 $page = isset($_GET['page']) ? max(1, (int)$_GET['page']) : 1;
-$offset = ($page - 1) * $results_per_page;
+
+if ($view_all) {
+    $base_url_param .= '&all=1';
+}
 
 // Get total count of results first
 $count_sql = "
@@ -78,9 +82,19 @@ $count_sql = "
 try {
     $count_stmt = $pdo->prepare($count_sql);
     $count_stmt->execute(['club_id_individual' => $club_id, 'club_id_team' => $club_id, 'club_id_coop' => $club_id]);
-    $total_results = $count_stmt->fetch(PDO::FETCH_ASSOC)['total'];
-    $total_pages = ceil($total_results / $results_per_page);
-    $has_more = $page < $total_pages;
+    $total_results = (int)$count_stmt->fetch(PDO::FETCH_ASSOC)['total'];
+
+    if ($view_all) {
+        $results_per_page = max(1, $total_results);
+        $page = 1;
+        $offset = 0;
+        $total_pages = 1;
+        $has_more = false;
+    } else {
+        $total_pages = (int)ceil($total_results / $results_per_page);
+        $offset = ($page - 1) * $results_per_page;
+        $has_more = $page < $total_pages;
+    }
 } catch (PDOException $e) {
     die("Database count query failed: " . $e->getMessage());
 }
@@ -274,34 +288,54 @@ try {
             <!-- Pagination Info and Load More Button -->
             <?php if ($total_results > 0): ?>
                 <div style="margin-top: 1.5rem; padding: 1rem; background: var(--bg-secondary); border-radius: var(--border-radius); text-align: center;">
-                    <p style="color: var(--text-light); margin-bottom: 1rem;">
-                        Showing <?php echo min($offset + 1, $total_results); ?> - <?php echo min($offset + count($game_results), $total_results); ?> of <?php echo $total_results; ?> results
-                    </p>
-                    
-                    <div style="display: flex; gap: 1rem; justify-content: center; align-items: center; flex-wrap: wrap;">
-                        <?php if ($page > 1): ?>
-                            <a href="?<?php echo $base_url_param; ?>&sort=<?php echo urlencode($sort_column); ?>&order=<?php echo urlencode($order); ?>&page=<?php echo $page - 1; ?>" 
+                    <?php if ($view_all): ?>
+                        <p style="color: var(--text-light); margin-bottom: 1rem;">
+                            Showing all <?php echo $total_results; ?> results
+                        </p>
+                        <div style="display: flex; gap: 1rem; justify-content: center; align-items: center; flex-wrap: wrap;">
+                            <?php 
+                            $paginated_base_param = !empty($club['slug']) ? 'slug=' . urlencode($club['slug']) : 'id=' . $club_id;
+                            ?>
+                            <a href="?<?php echo $paginated_base_param; ?>&sort=<?php echo urlencode($sort_column); ?>&order=<?php echo urlencode($order); ?>" 
                                class="btn btn--ghost">
-                                ← Show Previous Results
+                                Switch to Paginated View (25 per page)
                             </a>
-                        <?php endif; ?>
+                        </div>
+                    <?php else: ?>
+                        <p style="color: var(--text-light); margin-bottom: 1rem;">
+                            Showing <?php echo min($offset + 1, $total_results); ?> - <?php echo min($offset + count($game_results), $total_results); ?> of <?php echo $total_results; ?> results
+                        </p>
+                        
+                        <div style="display: flex; gap: 1rem; justify-content: center; align-items: center; flex-wrap: wrap;">
+                            <?php if ($page > 1): ?>
+                                <a href="?<?php echo $base_url_param; ?>&sort=<?php echo urlencode($sort_column); ?>&order=<?php echo urlencode($order); ?>&page=<?php echo $page - 1; ?>" 
+                                   class="btn btn--ghost">
+                                    ← Show Previous Results
+                                </a>
+                            <?php endif; ?>
+                            
+                            <?php if ($has_more): ?>
+                                <a href="?<?php echo $base_url_param; ?>&sort=<?php echo urlencode($sort_column); ?>&order=<?php echo urlencode($order); ?>&page=<?php echo $page + 1; ?>" 
+                                   class="btn btn--secondary">
+                                    Load More Results →
+                                </a>
+                            <?php endif; ?>
+
+                            <a href="?<?php echo $base_url_param; ?>&sort=<?php echo urlencode($sort_column); ?>&order=<?php echo urlencode($order); ?>&all=1" 
+                               class="btn btn--ghost">
+                                View All Results (<?php echo $total_results; ?>)
+                            </a>
+                        </div>
                         
                         <?php if ($has_more): ?>
-                            <a href="?<?php echo $base_url_param; ?>&sort=<?php echo urlencode($sort_column); ?>&order=<?php echo urlencode($order); ?>&page=<?php echo $page + 1; ?>" 
-                               class="btn btn--secondary">
-                                Load More Results →
-                            </a>
+                            <p style="color: var(--text-light); font-size: 0.875rem; margin-top: 0.75rem;">
+                                <?php echo $total_results - ($offset + count($game_results)); ?> more results available
+                            </p>
+                        <?php elseif ($page > 1): ?>
+                            <p style="color: var(--text-light); font-style: italic; margin-top: 0.75rem;">
+                                All results loaded • Page <?php echo $page; ?> of <?php echo $total_pages; ?>
+                            </p>
                         <?php endif; ?>
-                    </div>
-                    
-                    <?php if ($has_more): ?>
-                        <p style="color: var(--text-light); font-size: 0.875rem; margin-top: 0.75rem;">
-                            <?php echo $total_results - ($offset + count($game_results)); ?> more results available
-                        </p>
-                    <?php elseif ($page > 1): ?>
-                        <p style="color: var(--text-light); font-style: italic; margin-top: 0.75rem;">
-                            All results loaded • Page <?php echo $page; ?> of <?php echo $total_pages; ?>
-                        </p>
                     <?php endif; ?>
                 </div>
             <?php endif; ?>
