@@ -10,6 +10,16 @@
  *   POST /api/results.php  { "action": "delete", "result_id": N, "type": "...",
  *                            "confirm": true }           → delete a result
  *
+ * Reads (same auth; POST JSON, handy for CLIs and agents):
+ *
+ *   POST /api/results.php  { "action": "list", "what": "clubs" }
+ *   POST /api/results.php  { "action": "list", "what": "games|members|teams",
+ *                            "club_id": N }
+ *   POST /api/results.php  { "action": "recent", "club_id"?: N, "game_id"?: N,
+ *                            "limit"?: 10 }
+ *   (recent merges individual, team and cooperative results, newest first;
+ *    members listed are active only)
+ *
  * Create payloads (all IDs must belong to the game's club):
  *
  *   ranked          { game_id, member_id (winner), second_place_id,
@@ -44,8 +54,12 @@ function usage(): array {
         'api' => 'results',
         'version' => 1,
         'auth' => 'Authorization: Bearer <STATAPP_API_TOKEN>',
-        'actions' => ['create', 'delete'],
+        'actions' => ['create', 'delete', 'list', 'recent'],
         'types' => ['ranked', 'winner_losers', 'team', 'cooperative'],
+        'reads' => [
+            'list' => '{ "action": "list", "what": "clubs|games|members|teams", "club_id"? }',
+            'recent' => '{ "action": "recent", "club_id"?, "game_id"?, "limit"? }',
+        ],
         'docs' => 'See the header comment of api/results.php.',
     ];
 }
@@ -117,15 +131,85 @@ try {
         if (!isset($table_map[$type])) {
             respond(400, ['ok' => false, 'error' => 'Unknown type for delete.']);
         }
-        $stmt = $pdo->prepare("DELETE FROM {$table_map[$type]} WHERE result_id = ?");
-        $stmt->execute([$result_id]);
+        // Children first: correct whether or not the FK carries ON DELETE CASCADE.
         if ($type === 'winner_losers') {
             $pdo->prepare('DELETE FROM game_result_losers WHERE result_id = ?')->execute([$result_id]);
         }
         if ($type === 'cooperative') {
             $pdo->prepare('DELETE FROM cooperative_result_participants WHERE result_id = ?')->execute([$result_id]);
         }
+        $stmt = $pdo->prepare("DELETE FROM {$table_map[$type]} WHERE result_id = ?");
+        $stmt->execute([$result_id]);
         respond(200, ['ok' => true, 'deleted' => $stmt->rowCount() > 0, 'result_id' => $result_id]);
+    }
+
+    if ($action === 'list') {
+        $what = (string) ($data['what'] ?? '');
+        if ($what === 'clubs') {
+            $rows = $pdo->query('SELECT club_id AS id, club_name AS name FROM clubs ORDER BY club_name')
+                ->fetchAll(PDO::FETCH_ASSOC);
+            respond(200, ['ok' => true, 'rows' => $rows]);
+        }
+        if (!in_array($what, ['games', 'members', 'teams'], true)) {
+            respond(400, ['ok' => false, 'error' => 'list what must be clubs | games | members | teams.']);
+        }
+        $club_id = (int) ($data['club_id'] ?? 0);
+        if (!$club_id) {
+            respond(400, ['ok' => false, 'error' => 'list requires club_id (except what=clubs).']);
+        }
+        if ($what === 'games') {
+            $stmt = $pdo->prepare('SELECT game_id AS id, game_name AS name FROM games WHERE club_id = ? ORDER BY game_name');
+            $stmt->execute([$club_id]);
+        } elseif ($what === 'members') {
+            // Active only — mirrors the admin add-result dropdown.
+            $stmt = $pdo->prepare("SELECT member_id AS id, nickname, member_name AS name FROM members WHERE club_id = ? AND status = 'active' ORDER BY nickname");
+            $stmt->execute([$club_id]);
+        } else {
+            $stmt = $pdo->prepare('SELECT team_id AS id, team_name AS name FROM teams WHERE club_id = ? ORDER BY team_name');
+            $stmt->execute([$club_id]);
+        }
+        respond(200, ['ok' => true, 'rows' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
+    }
+
+    if ($action === 'recent') {
+        $limit = min(max((int) ($data['limit'] ?? 10), 1), 50);
+        $game_id = (int) ($data['game_id'] ?? 0);
+        $club_id = (int) ($data['club_id'] ?? 0);
+        if (!$game_id && !$club_id) {
+            respond(400, ['ok' => false, 'error' => 'recent requires game_id or club_id.']);
+        }
+        $scope = $game_id ? 'r.game_id = ' . $game_id : 'g.club_id = ' . $club_id;
+
+        $individual = $pdo->query(
+            "SELECT r.result_id, r.game_id, g.game_name, r.played_at, r.duration, r.num_players, " .
+            "COALESCE(m.nickname, m.member_name) AS winner, " .
+            "CASE WHEN EXISTS (SELECT 1 FROM game_result_losers l WHERE l.result_id = r.result_id) " .
+            "THEN 'winner_losers' ELSE 'ranked' END AS type " .
+            "FROM game_results r JOIN games g ON g.game_id = r.game_id " .
+            "LEFT JOIN members m ON m.member_id = r.member_id " .
+            "WHERE {$scope} ORDER BY r.played_at DESC LIMIT {$limit}"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $team_scope = $game_id ? 'r.game_id = ' . $game_id : 'g.club_id = ' . $club_id;
+        $team = $pdo->query(
+            "SELECT r.result_id, r.game_id, g.game_name, r.played_at, r.duration, r.num_teams AS num_players, " .
+            "t.team_name AS winner, 'team' AS type " .
+            "FROM team_game_results r JOIN games g ON g.game_id = r.game_id " .
+            "LEFT JOIN teams t ON t.team_id = r.team_id " .
+            "WHERE {$team_scope} ORDER BY r.played_at DESC LIMIT {$limit}"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $coop_scope = $game_id ? 'r.game_id = ' . $game_id : 'g.club_id = ' . $club_id;
+        $coop = $pdo->query(
+            "SELECT r.result_id, r.game_id, g.game_name, r.played_at, r.duration, r.num_participants AS num_players, " .
+            "r.outcome AS winner, 'cooperative' AS type " .
+            "FROM cooperative_game_results r JOIN games g ON g.game_id = r.game_id " .
+            "WHERE {$coop_scope} ORDER BY r.played_at DESC LIMIT {$limit}"
+        )->fetchAll(PDO::FETCH_ASSOC);
+
+        $rows = array_merge($individual, $team, $coop);
+        usort($rows, static fn($a, $b) => strcmp((string) $b['played_at'], (string) $a['played_at']));
+        respond(200, ['ok' => true, 'rows' => array_slice($rows, 0, $limit)]);
     }
 
     if ($action !== 'create') {
@@ -191,6 +275,7 @@ try {
     $team_ids = array_merge(
         isset($data['team_id']) ? [(int) $data['team_id']] : [],
         isset($data['second_place_id']) && $type === 'team' ? [(int) $data['second_place_id']] : [],
+        $type === 'team' ? array_map('intval', $data['additional_places'] ?? []) : [],
         ($data['participants']['type'] ?? '') === 'team' ? [($data['participants']['team_id'] ?? 0)] : []
     );
     if ($member_ids && !ids_exist($pdo, 'members', 'member_id', 'club_id', $member_ids, (int) $game['club_id'])) {
@@ -317,14 +402,16 @@ try {
         }
 
         $score = $data['score'] ?? null;
-        $difficulty = $data['difficulty'] ?? null;
+        // difficulty is VARCHAR(100) in the schema (admin stores labels like
+        // "Easy" or custom text) — keep it a string, never cast to int.
+        $difficulty = mb_substr(trim((string) ($data['difficulty'] ?? '')), 0, 100) ?: null;
         $scenario = mb_substr(trim((string) ($data['scenario'] ?? '')), 0, 255) ?: null;
 
         $stmt = $pdo->prepare('INSERT INTO cooperative_game_results (game_id, session_id, outcome, score, difficulty, scenario, num_participants, played_at, duration, notes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
         $stmt->execute([
             $game_id, $session_id, $outcome,
             $score !== null ? (int) $score : null,
-            $difficulty !== null ? (int) $difficulty : null,
+            $difficulty,
             $scenario, $num_participants, $played_at, $duration, $notes,
         ]);
         $result_id = (int) $pdo->lastInsertId();
