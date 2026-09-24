@@ -1,0 +1,399 @@
+#!/usr/bin/env php
+<?php
+declare(strict_types=1);
+/**
+ * statapp — agent-friendly CLI for the Board Game Club StatApp results API.
+ *
+ * Configuration (never commit secrets — pass at runtime):
+ *   STATAPP_BASE_URL   e.g. https://example.com/stat-app  (or --base-url)
+ *   STATAPP_API_TOKEN  Bearer token; an "op://..." reference is resolved
+ *                      via `op read` so 1Password stays the source of truth.
+ *   STATAPP_CLUB       default club name (or --club)
+ *
+ * Usage:
+ *   statapp clubs
+ *   statapp games [--club NAME]
+ *   statapp members [--club NAME]
+ *   statapp teams [--club NAME]
+ *   statapp results [--recent N] [--game NAME] [--club NAME] [--type T]
+ *   statapp record --game NAME --players A,B,C [--winner A] [--second B] [--vs]
+ *                  [--club NAME] [--duration N] [--played-at YYYY-MM-DDTHH:MM]
+ *                  [--notes "..."]
+ *     --players order is finish order: first = winner unless --winner given,
+ *     second = runner-up unless --second given. --vs records winner-vs-losers
+ *     (winner + everyone else as losers) instead of ranked.
+ *   statapp delete --id N --type ranked|winner_losers|team|cooperative --confirm
+ *   statapp raw '{"action":"list","what":"clubs"}'   (escape hatch: POST raw JSON)
+ *
+ * Global flags: --base-url URL, --token T, --club NAME, --json (machine output).
+ */
+
+function fail(string $msg): never {
+    fwrite(STDERR, "statapp: {$msg}\n");
+    exit(1);
+}
+
+/** Parse argv into [globals, command, options, positionals]. */
+function parse_argv(array $argv): array {
+    $globals = ['base-url' => null, 'token' => null, 'club' => null, 'json' => false];
+    $global_keys = array_keys($globals);
+    $command = null;
+    $opts = [];
+    $pos = [];
+    $args = array_slice($argv, 1);
+    foreach ($args as $a) {
+        if (str_starts_with($a, '--')) {
+            $kv = explode('=', substr($a, 2), 2);
+            $k = $kv[0];
+            $v = $kv[1] ?? null;
+            if ($command === null && in_array($k, $global_keys, true)) {
+                if ($k === 'json') {
+                    $globals['json'] = true;
+                } else {
+                    if ($v === null) {
+                        fail("--{$k} needs a value (use --{$k}=VALUE).");
+                    }
+                    $globals[$k] = $v;
+                }
+                continue;
+            }
+            if ($v === null) {
+                // Lookahead for a separate value is handled by callers via null check;
+                // here: bare --flag means true.
+                $opts[$k] = true;
+            } else {
+                $opts[$k] = $v;
+            }
+        } elseif ($command === null) {
+            $command = $a;
+        } else {
+            $pos[] = $a;
+        }
+    }
+    return [$globals, $command, $opts, $pos];
+}
+
+/** Option value: supports --key VALUE positionals stored by caller; here just normalize. */
+function opt(array $opts, array $pos, string $key, int &$pi): mixed {
+    // Support `--key VALUE` (space-separated): parse_argv stored bare --key as true
+    // and VALUE as a positional. Reattach on demand.
+    if (array_key_exists($key, $opts) && $opts[$key] === true && isset($pos[$pi])) {
+        $pi++;
+        return $pos[$pi - 1];
+    }
+    return $opts[$key] ?? null;
+}
+
+function base_url(?string $flag): string {
+    $url = $flag ?? getenv('STATAPP_BASE_URL') ?: '';
+    $url = rtrim(trim($url), '/');
+    if ($url === '') {
+        fail("no base URL. Set STATAPP_BASE_URL or pass --base-url (e.g. https://example.com/stat-app).");
+    }
+    return $url . '/api/results.php';
+}
+
+function api_token(?string $flag): string {
+    $tok = $flag ?? getenv('STATAPP_API_TOKEN') ?: '';
+    $tok = trim($tok);
+    if (str_starts_with($tok, 'op://')) {
+        $resolved = shell_exec('op read ' . escapeshellarg($tok) . ' 2>/dev/null');
+        if ($resolved === null || trim($resolved) === '') {
+            fail("could not resolve token via `op read`. Is 1Password CLI installed and signed in?");
+        }
+        $tok = trim($resolved);
+    }
+    if ($tok === '') {
+        fail("no API token. Set STATAPP_API_TOKEN (or an op:// reference) or pass --token.");
+    }
+    return $tok;
+}
+
+/** POST a JSON action; returns decoded body array (with _status). */
+function api(string $endpoint, string $token, array $payload): array {
+    $ctx = stream_context_create(['http' => [
+        'method' => 'POST',
+        'header' => "Content-Type: application/json\r\nAuthorization: Bearer {$token}\r\n",
+        'content' => json_encode($payload),
+        'ignore_errors' => true,
+        'timeout' => 30,
+    ]]);
+    $raw = @file_get_contents($endpoint, false, $ctx);
+    $status = 0;
+    foreach ($http_response_header ?? [] as $h) {
+        if (preg_match('#^HTTP/\S+\s+(\d+)#', $h, $m)) {
+            $status = (int) $m[1];
+        }
+    }
+    if ($raw === false) {
+        fail("request failed (HTTP {$status}). Is the base URL reachable?");
+    }
+    $body = json_decode($raw, true);
+    if (!is_array($body)) {
+        fail("non-JSON response (HTTP {$status}): " . substr($raw, 0, 200));
+    }
+    if (($body['ok'] ?? false) !== true) {
+        fail("API error (HTTP {$status}): " . ($body['error'] ?? 'unknown error'));
+    }
+    $body['_status'] = $status;
+    return $body;
+}
+
+function resolve_club(string $endpoint, string $token, ?string $name): array {
+    $res = api($endpoint, $token, ['action' => 'list', 'what' => 'clubs']);
+    $rows = $res['rows'] ?? [];
+    if ($name === null || $name === '') {
+        $env = getenv('STATAPP_CLUB') ?: '';
+        $name = $env !== '' ? $env : null;
+    }
+    if ($name === null) {
+        if (count($rows) === 1) {
+            return $rows[0];
+        }
+        $names = implode(', ', array_column($rows, 'name'));
+        fail(count($rows) === 0 ? 'no clubs found.' : "multiple clubs ({$names}). Pass --club NAME.");
+    }
+    foreach ($rows as $r) {
+        if (strcasecmp((string) $r['name'], $name) === 0) {
+            return $r;
+        }
+    }
+    $names = implode(', ', array_column($rows, 'name'));
+    fail("club '{$name}' not found. Known: {$names}.");
+}
+
+function resolve_name(array $rows, string $name, string $kind): array {
+    foreach ($rows as $r) {
+        if (strcasecmp((string) ($r['name'] ?? ''), $name) === 0
+            || (isset($r['nickname']) && strcasecmp((string) $r['nickname'], $name) === 0)) {
+            return $r;
+        }
+    }
+    $cands = array_map(fn($r) => (string) ($r['nickname'] ?? $r['name'] ?? ''), $rows);
+    fail("{$kind} '{$name}' not found. Known: " . implode(', ', $cands) . '.');
+}
+
+// ---------- main ----------
+
+[$globals, $command, $opts, $pos] = parse_argv($argv);
+// Global flags also work after the command (`statapp results --json`).
+foreach (['base-url', 'token', 'club'] as $gk) {
+    if ($globals[$gk] === null && isset($opts[$gk]) && $opts[$gk] !== true) {
+        $globals[$gk] = $opts[$gk];
+        unset($opts[$gk]);
+    }
+}
+if (isset($opts['json'])) {
+    $globals['json'] = true;
+    unset($opts['json']);
+}
+$pi = 0; // positional cursor for `--key VALUE` reattachment
+
+if ($command === null || $command === 'help' || $command === '--help' || $command === '-h') {
+    echo <<<'HELP'
+statapp — agent-friendly CLI for the Board Game Club StatApp results API.
+
+  statapp clubs
+  statapp games [--club NAME]
+  statapp members [--club NAME]
+  statapp teams [--club NAME]
+  statapp results [--recent N] [--game NAME] [--club NAME] [--type T]
+  statapp record --game NAME --players A,B,C [--winner A] [--second B] [--vs]
+                 [--club NAME] [--duration N] [--played-at YYYY-MM-DDTHH:MM]
+                 [--notes "..."]
+  statapp delete --id N --type T --confirm
+  statapp raw '{"action":"list","what":"clubs"}'
+
+Config: STATAPP_BASE_URL, STATAPP_API_TOKEN (or op:// reference), STATAPP_CLUB.
+Flags:  --base-url URL, --token T, --club NAME, --json. --players order is
+finish order; --vs records winner-vs-losers instead of ranked.
+
+HELP;
+    exit($command === null ? 1 : 0);
+}
+
+$out_json = $globals['json'];
+$emit = function (array $body, callable $pretty) use ($out_json): void {
+    if ($out_json) {
+        unset($body['_status']);
+        echo json_encode($body, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
+    } else {
+        $pretty($body);
+    }
+};
+
+switch ($command) {
+    case 'clubs':
+    case 'games':
+    case 'members':
+    case 'teams': {
+        $endpoint = base_url($globals['base-url']);
+        $token = api_token($globals['token']);
+        if ($command === 'clubs') {
+            $res = api($endpoint, $token, ['action' => 'list', 'what' => 'clubs']);
+            $emit($res, function ($b): void {
+                foreach ($b['rows'] as $r) {
+                    echo "#{$r['id']}  {$r['name']}\n";
+                }
+            });
+            break;
+        }
+        $club_name = opt($opts, $pos, 'club', $pi) ?? $globals['club'];
+        $club = resolve_club($endpoint, $token, is_string($club_name) ? $club_name : null);
+        $res = api($endpoint, $token, ['action' => 'list', 'what' => $command, 'club_id' => (int) $club['id']]);
+        $emit($res, function ($b) use ($command, $club): void {
+            echo "{$club['name']} — {$command}:\n";
+            foreach ($b['rows'] as $r) {
+                $extra = isset($r['nickname']) && $r['nickname'] !== $r['name'] ? " ({$r['nickname']})" : '';
+                echo "  #{$r['id']}  {$r['name']}{$extra}\n";
+            }
+        });
+        break;
+    }
+
+    case 'results': {
+        $endpoint = base_url($globals['base-url']);
+        $token = api_token($globals['token']);
+        $recent = (int) (opt($opts, $pos, 'recent', $pi) ?? 10);
+        $type = opt($opts, $pos, 'type', $pi);
+        $game_name = opt($opts, $pos, 'game', $pi);
+        $club_name = opt($opts, $pos, 'club', $pi) ?? $globals['club'];
+        $payload = ['action' => 'recent', 'limit' => $recent];
+        if ($game_name !== null && $game_name !== true) {
+            $club = resolve_club($endpoint, $token, is_string($club_name) ? $club_name : null);
+            $games = api($endpoint, $token, ['action' => 'list', 'what' => 'games', 'club_id' => (int) $club['id']]);
+            $game = resolve_name($games['rows'], (string) $game_name, 'game');
+            $payload['game_id'] = (int) $game['id'];
+        } elseif ($club_name !== null) {
+            $club = resolve_club($endpoint, $token, $club_name);
+            $payload['club_id'] = (int) $club['id'];
+        } else {
+            // No scope flags: default to the (single or specified) club.
+            $club = resolve_club($endpoint, $token, null);
+            $payload['club_id'] = (int) $club['id'];
+        }
+        $res = api($endpoint, $token, $payload);
+        $emit($res, function ($b) use ($type): void {
+            foreach ($b['rows'] as $r) {
+                if ($type !== null && $type !== true && strcasecmp((string) $r['type'], (string) $type) !== 0) {
+                    continue;
+                }
+                echo "#{$r['result_id']} [{$r['type']}] {$r['game_name']} — {$r['winner']} — {$r['played_at']} ({$r['duration']}m, {$r['num_players']}p)\n";
+            }
+        });
+        break;
+    }
+
+    case 'record': {
+        $endpoint = base_url($globals['base-url']);
+        $token = api_token($globals['token']);
+        $game_name = opt($opts, $pos, 'game', $pi);
+        $players_raw = opt($opts, $pos, 'players', $pi);
+        if ($game_name === null || $game_name === true) {
+            fail('record needs --game NAME.');
+        }
+        if ($players_raw === null || $players_raw === true) {
+            fail('record needs --players A,B,C (finish order).');
+        }
+        $players = array_values(array_filter(array_map('trim', explode(',', (string) $players_raw))));
+        if (count($players) < 2) {
+            fail('--players needs at least two players.');
+        }
+        $club_name = opt($opts, $pos, 'club', $pi) ?? $globals['club'];
+        $club = resolve_club($endpoint, $token, is_string($club_name) ? $club_name : null);
+        $games = api($endpoint, $token, ['action' => 'list', 'what' => 'games', 'club_id' => (int) $club['id']]);
+        $game = resolve_name($games['rows'], (string) $game_name, 'game');
+        $members = api($endpoint, $token, ['action' => 'list', 'what' => 'members', 'club_id' => (int) $club['id']]);
+        $ids = [];
+        foreach ($players as $p) {
+            $ids[$p] = (int) resolve_name($members['rows'], $p, 'player')['id'];
+        }
+        $winner_name = opt($opts, $pos, 'winner', $pi);
+        $winner_name = ($winner_name === null || $winner_name === true) ? $players[0] : (string) $winner_name;
+        if (!isset($ids[$winner_name])) {
+            fail("--winner '{$winner_name}' is not in --players (" . implode(',', $players) . ').');
+        }
+        $duration = (int) (opt($opts, $pos, 'duration', $pi) ?? 60);
+        if ($duration <= 0 || $duration > 1440) {
+            fail('--duration must be 1..1440 minutes.');
+        }
+        $payload = [
+            'action' => 'create',
+            'game_id' => (int) $game['id'],
+            'member_id' => $ids[$winner_name],
+            'duration_minutes' => $duration,
+        ];
+        foreach (['played-at' => 'played_at', 'notes' => 'notes'] as $flag => $field) {
+            $v = opt($opts, $pos, $flag, $pi);
+            if ($v !== null && $v !== true) {
+                $payload[$field] = ($flag === 'played-at') ? str_replace(' ', 'T', (string) $v) : $v;
+            }
+        }
+        if (isset($opts['vs'])) {
+            $payload['type'] = 'winner_losers';
+            $payload['losers'] = array_values(array_intersect_key($ids, array_flip(array_filter($players, fn($p) => $p !== $winner_name))));
+            $desc = 'winner-vs-losers';
+        } else {
+            $payload['type'] = 'ranked';
+            $second_name = opt($opts, $pos, 'second', $pi);
+            $second_name = ($second_name === null || $second_name === true) ? ($players[1] ?? null) : (string) $second_name;
+            if ($second_name === null || !isset($ids[$second_name])) {
+                fail("need --second NAME (or a --players list with 2+ names).");
+            }
+            if ($second_name === $winner_name) {
+                fail('--second must differ from --winner.');
+            }
+            $payload['second_place_id'] = $ids[$second_name];
+            $rest = array_values(array_filter($players, fn($p) => $p !== $winner_name && $p !== $second_name));
+            if ($rest) {
+                $payload['additional_places'] = array_map(fn($p) => $ids[$p], $rest);
+            }
+            $desc = 'ranked';
+        }
+        $res = api($endpoint, $token, $payload);
+        $emit($res, function ($b) use ($desc, $game_name, $winner_name, $players): void {
+            echo "Recorded {$desc} result #{$b['result_id']}: {$game_name} — winner {$winner_name} (" . count($players) . " players).\n";
+        });
+        break;
+    }
+
+    case 'delete': {
+        $endpoint = base_url($globals['base-url']);
+        $token = api_token($globals['token']);
+        $id = opt($opts, $pos, 'id', $pi);
+        $type = opt($opts, $pos, 'type', $pi);
+        if ($id === null || $id === true || $type === null || $type === true) {
+            fail('delete needs --id N and --type ranked|winner_losers|team|cooperative.');
+        }
+        if (!isset($opts['confirm'])) {
+            fail('refusing to delete without --confirm. Re-run with --confirm to proceed.');
+        }
+        $res = api($endpoint, $token, [
+            'action' => 'delete', 'result_id' => (int) $id, 'type' => (string) $type, 'confirm' => true,
+        ]);
+        $emit($res, function ($b): void {
+            echo ($b['deleted'] ? 'Deleted' : 'No such') . " result #{$b['result_id']}.\n";
+        });
+        break;
+    }
+
+    case 'raw': {
+        $endpoint = base_url($globals['base-url']);
+        $token = api_token($globals['token']);
+        $json = $pos[$pi] ?? null;
+        if ($json === null) {
+            fail("raw needs a JSON payload argument: statapp raw '{\"action\":\"list\",...}'.");
+        }
+        $payload = json_decode($json, true);
+        if (!is_array($payload)) {
+            fail('raw payload is not valid JSON.');
+        }
+        $res = api($endpoint, $token, $payload);
+        unset($res['_status']);
+        echo json_encode($res, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) . "\n";
+        break;
+    }
+
+    default:
+        fail("unknown command '{$command}'. Try: clubs, games, members, teams, results, record, delete, raw.");
+}
